@@ -23,6 +23,6 @@ executable hosts-server
                , data-default
                , bytestring
                , attoparsec
-               , iproute >= 1.2.4 && < 1.3.0
-               , dns >= 0.3.5 && < 0.4.0
+               , iproute
+               , dns
 

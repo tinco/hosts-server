@@ -77,7 +77,7 @@ handleRequest conf req =
     lookupHosts = do
         q <- listToMaybe . filterA . question $ req
         (_, ip) <- listToMaybe . filterHost (qname q) $ hosts conf
-        return $ responseA ident q ip
+        return $ responseA ident q [ip]
 
 {--
  - Parse request and compose response.
