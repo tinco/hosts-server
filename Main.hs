@@ -13,7 +13,7 @@ import System.Timeout (timeout)
 import Network.Socket.ByteString (sendAll, sendAllTo, recvFrom)
 import Network.Socket hiding (recvFrom)
 import Network.DNS
-import Data.Attoparsec.Char8
+import Data.Attoparsec.ByteString.Char8
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy as BL
 
@@ -24,6 +24,7 @@ data Conf = Conf
   , timeOut     :: Int
   , nameservers :: [HostName]
   , hosts       :: [Host]
+  , bindAddress :: AddrInfo
   }
 
 instance Default Conf where
@@ -32,6 +33,7 @@ instance Default Conf where
       , timeOut     = 10 * 1000 * 1000
       , nameservers = []
       , hosts       = []
+      , bindAddress = defaultHints
       }
 
 toEither :: a -> Maybe b -> Either a b
@@ -97,16 +99,12 @@ handlePacket conf@Conf{..} sock addr s =
     )
     (decode (BL.fromChunks [s]))
 
-run :: Conf -> IO ()
-run conf = withSocketsDo $ do
-    addrinfos <- getAddrInfo
-                   (Just (defaultHints {addrFlags = [AI_PASSIVE]}))
-                   Nothing (Just "domain")
-    addrinfo <- maybe (fail "no addr info") return (listToMaybe addrinfos)
-    sock <- socket (addrFamily addrinfo) Datagram defaultProtocol
-    bindSocket sock (addrAddress addrinfo)
+runServer :: Conf -> IO ()
+runServer conf@Conf{..} = withSocketsDo $ do
+    sock <- socket (addrFamily bindAddress) (addrSocketType bindAddress) (addrProtocol bindAddress)
+    bind sock (addrAddress bindAddress)
     forever $ do
-        (s, addr) <- recvFrom sock (bufSize conf)
+        (s, addr) <- recvFrom sock bufSize
         forkIO $ handlePacket conf sock addr s
 
 {--
@@ -143,4 +141,21 @@ main = do
     args <- getArgs
     (hosts, servers) <- readHosts $ fromMaybe "./hosts" (listToMaybe args)
     print (hosts, servers)
-    run def{hosts=hosts, nameservers=servers}
+    runServer def{hosts=hosts, nameservers=servers, bindAddress=inet4LocalAddr}
+
+inet4LocalAddr :: AddrInfo
+inet4LocalAddr = defaultHints {
+      addrFamily = AF_INET,
+      addrSocketType = Datagram,
+      addrAddress = SockAddrInet 53 (tupleToHostAddress (0,0,0,0))
+    }
+
+-- Getting local interface
+-- 
+{- 
+    addrinfos <- getAddrInfo
+                   (Just (defaultHints {addrFlags = [AI_PASSIVE]}))
+                   Nothing (Just "domain")
+    addrinfo <- maybe (fail "no addr info") return (listToMaybe addrinfos)
+    -}
+ 
