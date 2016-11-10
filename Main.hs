@@ -48,7 +48,9 @@ data PacketResponse =
   PacketDecodeError String |
   PacketResponseError String |
   PacketShouldProxy HostName DNSFormat |
-  PacketShouldReply B.ByteString
+  PacketShouldReply DNSMessage
+
+data ServerAction = SendReply DNSMessage
 
 {--
  - Proxy dns request to a real dns server.
@@ -101,7 +103,7 @@ handlePacket conf@Conf{..} s =
     (\req -> case handleRequest conf req of
             NoResponseError e -> PacketResponseError e
             ShouldProxy host r -> PacketShouldProxy host r
-            RequestResponse rsp -> PacketShouldReply $ encodePacket rsp
+            RequestResponse rsp -> PacketShouldReply rsp
     ) (decodePacket s)
 
 decodePacket :: B.ByteString -> Either String DNSMessage
@@ -110,30 +112,41 @@ decodePacket s = decode (BL.fromChunks [s])
 encodePacket :: DNSMessage -> B.ByteString
 encodePacket p = B.concat . BL.toChunks $ encode p
 
-runServer :: Conf -> IO ()
-runServer conf@Conf{..} = withSocketsDo $ do
+type PacketHandler = Conf -> B.ByteString -> IO (Maybe ServerAction)
+
+runServer :: Conf -> PacketHandler -> IO ()
+runServer conf@Conf{..} handler = withSocketsDo $ do
     sock <- socket (addrFamily bindAddress) (addrSocketType bindAddress) (addrProtocol bindAddress)
     bind sock (addrAddress bindAddress)
     forever $ do
         (s, addr) <- recvFrom sock bufSize
-
         forkIO $ do
-          case handlePacket conf s of
-            PacketDecodeError e -> putStrLn $ "PacketDecodeError: " ++ e
-            PacketResponseError e -> putStrLn $ "PacketResponseError: " ++ e
-            PacketShouldProxy h p -> do
-              prx <- proxyRequest conf h p
-              case prx of
-                Left e -> putStrLn $ "ProxyError: " ++ e
-                Right rsp -> reply sock addr $ encodePacket rsp
-            PacketShouldReply p -> reply sock addr p
+          action <- handler conf s
+          case action of
+            Nothing -> return ()
+            Just (SendReply p) -> do
+              result <- timeout timeOut (sendAllTo sock (encodePacket p) addr)
+              case result of
+                Just _ -> return ()
+                Nothing -> putStrLn "send response timeout"
 
-        where
-          reply sock addr p = do
-            result <- timeout timeOut (sendAllTo sock p addr)
-            case result of
-              Just _ -> return ()
-              Nothing -> putStrLn "send response timeout"
+dnsHandleResponse :: Conf -> PacketResponse -> IO(Maybe ServerAction)
+dnsHandleResponse conf@Conf{..} pr = case pr of
+  PacketDecodeError e -> do
+    putStrLn $ "PacketDecodeError: " ++ e
+    return Nothing
+  PacketResponseError e -> do
+    putStrLn $ "PacketResponseError: " ++ e
+    return Nothing
+  PacketShouldProxy h p -> do
+    prx <- proxyRequest conf h p
+    case prx of
+      Left e -> do
+        putStrLn $ "ProxyError: " ++ e
+        return Nothing
+      Right rsp -> do
+        return $ Just $ SendReply rsp
+  PacketShouldReply p -> return $ Just $ SendReply p
 
 {--
  - parse config file.
@@ -169,7 +182,8 @@ main = do
     args <- getArgs
     (hosts, servers) <- readHosts $ fromMaybe "./hosts" (listToMaybe args)
     print (hosts, servers)
-    runServer def{hosts=hosts, nameservers=servers, bindAddress=inet4LocalAddr}
+    let handler conf s = dnsHandleResponse conf $ handlePacket conf s
+    runServer def{hosts=hosts, nameservers=servers, bindAddress=inet4LocalAddr} handler
 
 inet4LocalAddr :: AddrInfo
 inet4LocalAddr = defaultHints {
