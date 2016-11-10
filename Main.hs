@@ -39,6 +39,17 @@ instance Default Conf where
 toEither :: a -> Maybe b -> Either a b
 toEither a = maybe (Left a) Right
 
+data RequestResponse =
+  ShouldProxy HostName DNSFormat |
+  NoResponseError String |
+  RequestResponse DNSFormat
+
+data PacketResponse =
+  PacketDecodeError String |
+  PacketResponseError String |
+  PacketShouldProxy HostName DNSFormat |
+  PacketShouldReply B.ByteString
+
 {--
  - Proxy dns request to a real dns server.
  -}
@@ -46,8 +57,7 @@ proxyRequest :: Conf -> HostName -> DNSFormat -> IO (Either String DNSFormat)
 proxyRequest Conf{..} server req = do
     let rc = defaultResolvConf { resolvInfo = RCHostName server }
         worker Resolver{..} = do
-            let packet = B.concat . BL.toChunks $ encode req
-            sendAll dnsSock packet
+            sendAll dnsSock $ encodePacket req
             receive dnsSock
     rs <- makeResolvSeed rc
     withResolver rs $ \r ->
@@ -63,13 +73,13 @@ proxyRequest Conf{..} server req = do
 {--
  - Handle A query for domain suffixes configured, and proxy other requests to real dns server.
  -}
-handleRequest :: Conf -> DNSFormat -> IO (Either String DNSFormat)
+handleRequest :: Conf -> DNSFormat -> RequestResponse
 handleRequest conf req =
     case lookupHosts of
-        (Just rsp) -> return $ Right rsp
+        (Just rsp) -> RequestResponse rsp
         Nothing  -> maybe
-                    (return $ Left "nameserver not configured.")
-                    (\srv -> proxyRequest conf srv req)
+                    (NoResponseError "nameserver not configured.")
+                    (\srv -> ShouldProxy srv req)
                     (listToMaybe (nameservers conf))
   where
     filterA = filter ((==A) . qtype)
@@ -84,20 +94,21 @@ handleRequest conf req =
 {--
  - Parse request and compose response.
  -}
-handlePacket :: Conf -> Socket -> SockAddr -> B.ByteString -> IO ()
-handlePacket conf@Conf{..} sock addr s =
+handlePacket :: Conf -> B.ByteString -> PacketResponse
+handlePacket conf@Conf{..} s =
     either
-    (putStrLn . ("decode fail:"++))
-    (\req -> do
-        handleRequest conf req >>=
-            either
-            putStrLn
-            (\rsp -> let packet = B.concat . BL.toChunks $ encode rsp
-                     in  timeout timeOut (sendAllTo sock packet addr) >>=
-                         maybe (putStrLn "send response timeout") return
-            )
-    )
-    (decode (BL.fromChunks [s]))
+    (PacketDecodeError . ("decode fail:"++))
+    (\req -> case handleRequest conf req of
+            NoResponseError e -> PacketResponseError e
+            ShouldProxy host r -> PacketShouldProxy host r
+            RequestResponse rsp -> PacketShouldReply $ encodePacket rsp
+    ) (decodePacket s)
+
+decodePacket :: B.ByteString -> Either String DNSMessage
+decodePacket s = decode (BL.fromChunks [s])
+
+encodePacket :: DNSMessage -> B.ByteString
+encodePacket p = B.concat . BL.toChunks $ encode p
 
 runServer :: Conf -> IO ()
 runServer conf@Conf{..} = withSocketsDo $ do
@@ -105,7 +116,24 @@ runServer conf@Conf{..} = withSocketsDo $ do
     bind sock (addrAddress bindAddress)
     forever $ do
         (s, addr) <- recvFrom sock bufSize
-        forkIO $ handlePacket conf sock addr s
+
+        forkIO $ do
+          case handlePacket conf s of
+            PacketDecodeError e -> putStrLn $ "PacketDecodeError: " ++ e
+            PacketResponseError e -> putStrLn $ "PacketResponseError: " ++ e
+            PacketShouldProxy h p -> do
+              prx <- proxyRequest conf h p
+              case prx of
+                Left e -> putStrLn $ "ProxyError: " ++ e
+                Right rsp -> reply sock addr $ encodePacket rsp
+            PacketShouldReply p -> reply sock addr p
+
+        where
+          reply sock addr p = do
+            result <- timeout timeOut (sendAllTo sock p addr)
+            case result of
+              Just _ -> return ()
+              Nothing -> putStrLn "send response timeout"
 
 {--
  - parse config file.
