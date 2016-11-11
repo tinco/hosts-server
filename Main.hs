@@ -1,56 +1,31 @@
 {-# LANGUAGE RecordWildCards, OverloadedStrings #-}
 
 import Prelude hiding (takeWhile)
-import Control.Applicative ( (<$>), (<*>) )
-import Control.Concurrent (forkIO)
-import Control.Monad (forever)
 import Data.Default (Default(def))
+import Control.Applicative ( (<$>), (<*>) )
 import Data.IP (IPv4, toIPv4)
-import Data.List (partition)
 import Data.Maybe
 import System.Environment (getArgs)
 import System.Timeout (timeout)
 import Network.Socket.ByteString (sendAll, sendAllTo, recvFrom)
 import Network.Socket hiding (recvFrom)
 import Network.DNS
-import Data.Attoparsec.ByteString.Char8
+
+import HostsServer.Server
+import HostsServer.Config
+
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy as BL
+import qualified Data.Attoparsec.ByteString.Char8 as BP
 
-type Host = (Domain, IPv4)
+main :: IO ()
+main = do
+    args <- getArgs
+    (hosts, servers) <- readHosts $ fromMaybe "./hosts" (listToMaybe args)
+    print (hosts, servers)
+    let handler conf s = dnsHandleResponse conf $ handlePacket conf s
+    runServer def{hosts=hosts, nameservers=servers, bindAddress=inet4LocalAddr} handler
 
-data Conf = Conf
-  { bufSize     :: Int
-  , timeOut     :: Int
-  , nameservers :: [HostName]
-  , hosts       :: [Host]
-  , bindAddress :: AddrInfo
-  }
-
-instance Default Conf where
-    def = Conf
-      { bufSize     = 512
-      , timeOut     = 10 * 1000 * 1000
-      , nameservers = []
-      , hosts       = []
-      , bindAddress = defaultHints
-      }
-
-toEither :: a -> Maybe b -> Either a b
-toEither a = maybe (Left a) Right
-
-data RequestResponse =
-  ShouldProxy HostName DNSFormat |
-  NoResponseError String |
-  RequestResponse DNSFormat
-
-data PacketResponse =
-  PacketDecodeError String |
-  PacketResponseError String |
-  PacketShouldProxy HostName DNSFormat |
-  PacketShouldReply DNSMessage
-
-data ServerAction = SendReply DNSMessage
 
 {--
  - Proxy dns request to a real dns server.
@@ -106,30 +81,6 @@ handlePacket conf@Conf{..} s =
             RequestResponse rsp -> PacketShouldReply rsp
     ) (decodePacket s)
 
-decodePacket :: B.ByteString -> Either String DNSMessage
-decodePacket s = decode (BL.fromChunks [s])
-
-encodePacket :: DNSMessage -> B.ByteString
-encodePacket p = B.concat . BL.toChunks $ encode p
-
-type PacketHandler = Conf -> B.ByteString -> IO (Maybe ServerAction)
-
-runServer :: Conf -> PacketHandler -> IO ()
-runServer conf@Conf{..} handler = withSocketsDo $ do
-    sock <- socket (addrFamily bindAddress) (addrSocketType bindAddress) (addrProtocol bindAddress)
-    bind sock (addrAddress bindAddress)
-    forever $ do
-        (s, addr) <- recvFrom sock bufSize
-        forkIO $ do
-          action <- handler conf s
-          case action of
-            Nothing -> return ()
-            Just (SendReply p) -> do
-              result <- timeout timeOut (sendAllTo sock (encodePacket p) addr)
-              case result of
-                Just _ -> return ()
-                Nothing -> putStrLn "send response timeout"
-
 dnsHandleResponse :: Conf -> PacketResponse -> IO(Maybe ServerAction)
 dnsHandleResponse conf@Conf{..} pr = case pr of
   PacketDecodeError e -> do
@@ -148,42 +99,6 @@ dnsHandleResponse conf@Conf{..} pr = case pr of
         return $ Just $ SendReply rsp
   PacketShouldReply p -> return $ Just $ SendReply p
 
-{--
- - parse config file.
- -}
-readHosts :: FilePath -> IO ([Host], [HostName])
-readHosts filename =
-    B.readFile filename >>= either (fail . ("parse hosts fail:"++)) return . parseHosts
-  where
-    parseHosts :: B.ByteString -> Either String ([Host], [HostName])
-    parseHosts s = let (serverLines, hostLines) = partition (B.isPrefixOf "nameserver") (B.lines s)
-                   in  (,) <$> mapM (parseOnly host) hostLines
-                           <*> mapM (parseOnly nameserver) serverLines
-
-    host :: Parser Host
-    host = do
-        skipSpace
-        ip <- toIPv4 . map read <$> (many1 digit `sepBy` string ".")
-        _ <- space
-        skipSpace
-        dom <- takeWhile (not . isSpace)
-        skipSpace
-        return (dom, ip)
-
-    nameserver :: Parser HostName
-    nameserver = do
-        _ <- string "nameserver"
-        _ <- space
-        skipSpace
-        B.unpack <$> takeWhile (not . isSpace)
-
-main :: IO ()
-main = do
-    args <- getArgs
-    (hosts, servers) <- readHosts $ fromMaybe "./hosts" (listToMaybe args)
-    print (hosts, servers)
-    let handler conf s = dnsHandleResponse conf $ handlePacket conf s
-    runServer def{hosts=hosts, nameservers=servers, bindAddress=inet4LocalAddr} handler
 
 inet4LocalAddr :: AddrInfo
 inet4LocalAddr = defaultHints {
@@ -191,6 +106,9 @@ inet4LocalAddr = defaultHints {
       addrSocketType = Datagram,
       addrAddress = SockAddrInet 53 (tupleToHostAddress (0,0,0,0))
     }
+
+toEither :: a -> Maybe b -> Either a b
+toEither a = maybe (Left a) Right
 
 -- Getting local interface
 -- 

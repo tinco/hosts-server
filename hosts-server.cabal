@@ -18,6 +18,7 @@ source-repository head
 executable hosts-server
   GHC-Options:   -Wall
   main-is:       Main.hs
+  other-modules: HostsServer.Server, HostsServer.Config
   build-depends: base
                , network
                , data-default
